@@ -3,8 +3,9 @@ import logging
 import time
 import traceback
 import re
+from typing import Dict
 import psycopg2
-from psycopg2 import OperationalError, sql
+from psycopg2 import pool, OperationalError, sql
 from azure.storage.blob import BlobServiceClient
 from pyspark.sql import SparkSession
 
