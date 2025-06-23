@@ -7,15 +7,16 @@ from functools import wraps
 import re
 import sys
 import traceback
-import os
 from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql.functions import (
     current_timestamp,
     lit,
-    sha2,
     concat_ws,
     col,
+    udf,
 )
+from pyspark.sql.types import StringType
+import hashlib
 from delta.tables import DeltaTable
 from tenacity import (
     retry,
@@ -43,6 +44,13 @@ def log_exceptions(default=None, exit_on_error=False):
                 return default
         return wrapper
     return decorator
+
+
+@udf(StringType())
+def sha3_512_udf(val: str) -> Optional[str]:
+    if val is None:
+        return None
+    return hashlib.sha3_512(val.encode("utf-8")).hexdigest()
 
 @dataclass
 class ServerDetails:
@@ -343,11 +351,8 @@ class LeadDepotETL:
             "EDW_EXTERNAL_SOURCE_SYSTEM",
         }
         columns_to_hash = [c for c in df.columns if c not in exclude_cols and c != hash_column]
-        if not columns_to_hash:
-            logging.warning(f"No columns available for hashing in table {table_name}.")
-            df = df.withColumn(hash_column, sha2(lit(""), 512))  # << SHA-512 here
-        else:
-            df = df.withColumn(hash_column, sha2(concat_ws("||", *[col(c).cast("string") for c in columns_to_hash]), 512))  # << SHA-512 here
+        concatenated = concat_ws("||", *[col(c).cast("string") for c in columns_to_hash]) if columns_to_hash else lit("")
+        df = df.withColumn(hash_column, sha3_512_udf(concatenated))
 
         new_col_order = [hash_column] + [c for c in df.columns if c != hash_column]
         df = df.select(new_col_order)
@@ -436,30 +441,6 @@ class LeadDepotETL:
             logging.error("Snowflake read failed after retries")
             raise exc.last_attempt.exception()
 
-    def _get_watermark_path(self, table_name: str) -> str:
-        return (
-            f"{self.METADATA_BASE_PATH}/etl_last_update_{table_name}.txt"
-        )
-
-    def _read_watermark(self, table_name: str) -> Optional[str]:
-        path = self._get_watermark_path(table_name)
-        try:
-            df = self.spark.read.text(path)
-            watermark = df.first()[0].strip()
-            logging.info(f"Read watermark for {table_name}: {watermark}")
-            return watermark
-        except Exception as ex:
-            logging.info(
-                f"No watermark found for {table_name} at {path} (likely first run): {ex}"
-            )
-            return None
-
-    def _write_watermark(self, table_name: str, value: str):
-        path = self._get_watermark_path(table_name)
-        self.spark.createDataFrame([(value,)], ["watermark"]).coalesce(1).write.mode(
-            "overwrite"
-        ).text(path)
-        logging.info(f"Watermark for {table_name} written to {path}: {value}")
 
     @log_exceptions(default=[])
     def discover_all_tables(self) -> List[str]:
@@ -516,109 +497,72 @@ class LeadDepotETL:
             f"CAST(NULL AS VARCHAR(50)) AS [{c}]" if dt in ("money", "sql_variant") else f"[{c}]"
             for c, dt in columns
         ]
-        etl_col = "ETL_LAST_UPDATE_DATE"
-        watermark = None
-        full_sync_needed = False
-        if self.etl_mode == "incremental":
-            watermark = self._read_watermark(table_name)
-            if not watermark:
-                logging.info(f"No watermark found for {table_name}; full sync will be performed (truncate and load all data).")
-                full_sync_needed = True
-        elif self.etl_mode == "historical":
-            full_sync_needed = True
-
         query = f"SELECT {', '.join(select_parts)} FROM dbo.{table_name}"
-        if self.etl_mode == "incremental" and watermark and not full_sync_needed:
-            query += f" WHERE [{etl_col}] > '{watermark}'"
-            logging.info(f"Delta extract for {table_name} using query: {query}")
-        else:
-            logging.info(f"Full extract for {table_name} using query: {query}")
+        logging.info(f"Extract query for {table_name}: {query}")
 
         df = self._read_sql_server_with_retry(jdbc_url, query)
         df = self.clean_column_names(df)
         logging.info(f"Data extracted from table: {table_name}")
-
         if not df.columns or df.rdd.isEmpty():
             logging.warning(f"No data found in table {table_name}. Skipping.")
-            return None, full_sync_needed
-        return df, full_sync_needed
+            return None, False
+        return df, False
 
     @log_exceptions()
-    def write_to_adls(self, df: DataFrame, table_name: str, full_sync_needed: bool = False) -> None:
+    def write_to_adls(self, df: DataFrame, table_name: str) -> None:
         path = f"{self.ADLS_BASE_PATH}/{table_name}"
         logging.info(f"Writing data to ADLS for table: {table_name} -> {path}")
         hash_column = self.SNOWFLAKE_TABLES.get(table_name, {}).get("hash_column_name")
-        logging.info(f"ETL_MODE is {self.etl_mode}, full_sync_needed={full_sync_needed}")
-        if df.rdd.isEmpty():
-            logging.warning(
-                f"Source DataFrame for table {table_name} is empty. Full sync will delete all target records if they exist."
-            )
-            if self.etl_mode == "incremental" and hash_column and DeltaTable.isDeltaTable(self.spark, path):
-                delta_table = DeltaTable.forPath(self.spark, path)
-                delta_table.delete("true")
-                logging.info(f"All records deleted from ADLS Delta table for table: {table_name}")
-            else:
-                logging.warning(
-                    f"No delete performed for table {table_name} (table may not exist or ETL_MODE is historical)."
-                )
-            return
-
-        if self.etl_mode == "historical" or full_sync_needed or not hash_column:
-            df.write.format("delta").option("delta.columnMapping.mode", "name").option(
-                "delta.minReaderVersion", "2"
-            ).option("delta.minWriterVersion", "5").option("mergeSchema", "true").option(
-                "overwriteSchema", "true"
-            ).mode("overwrite").save(path)
-            logging.info(f"Data overwritten in ADLS for table: {table_name}")
+        if self.etl_mode == "historical" or not hash_column:
+            mode = "overwrite"
         else:
             if DeltaTable.isDeltaTable(self.spark, path):
-                delta_table = DeltaTable.forPath(self.spark, path)
-                merge_condition = f"source.{hash_column} = target.{hash_column}"
-                delta_table.alias("target").merge(
-                    source=df.alias("source"), condition=merge_condition
-                ).whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()
-                temp_view = f"source_hashes_{table_name}"
-                df.select(hash_column).distinct().createOrReplaceTempView(temp_view)
-                delete_condition = f"{hash_column} NOT IN (SELECT {hash_column} FROM {temp_view})"
-                delta_table.delete(delete_condition)
-                logging.info(f"Delta merge and delete completed for table: {table_name}")
+                existing = (
+                    self.spark.read.format("delta").load(path).select(hash_column).distinct()
+                )
+                df = df.join(existing, on=hash_column, how="left_anti")
+                if df.rdd.isEmpty():
+                    logging.info(f"No new records to append for table: {table_name}")
+                    return
+                mode = "append"
             else:
-                df.write.format("delta").option("delta.columnMapping.mode", "name").option(
-                    "delta.minReaderVersion", "2"
-                ).option("delta.minWriterVersion", "5").option("mergeSchema", "true").option(
-                    "overwriteSchema", "true"
-                ).mode("overwrite").save(path)
-                logging.info(f"Initial Delta table created for table: {table_name}")
+                mode = "overwrite"
+        logging.info(f"ADLS write mode for table {table_name}: {mode}")
+        (
+            df.write.format("delta")
+            .option("delta.columnMapping.mode", "name")
+            .option("delta.minReaderVersion", "2")
+            .option("delta.minWriterVersion", "5")
+            .mode(mode)
+            .option("mergeSchema", "true")
+            .option("overwriteSchema", "true")
+            .save(path)
+        )
+        logging.info(f"Data written to ADLS for table: {table_name}")
 
     @log_exceptions()
-    def load_to_snowflake(self, df: DataFrame, table_config: Dict[str, str], full_sync_needed: bool = False) -> None:
+    def load_to_snowflake(self, df: DataFrame, table_config: Dict[str, str]) -> None:
         table = table_config["staging_table_name"]
         hash_column = table_config.get("hash_column_name")
-        logging.info(f"ETL_MODE is {self.etl_mode}, full_sync_needed={full_sync_needed}")
-        if self.etl_mode == "historical" or full_sync_needed or not hash_column:
-            logging.info(f"Loading data into Snowflake table (overwrite): {table}")
-            self._write_snowflake_with_retry(df, table, mode="overwrite")
+        if self.etl_mode == "historical" or not hash_column:
+            mode = "overwrite"
         else:
-            temp_stage_table = table + "_STAGE"
-            logging.info(f"Loading data into temp Snowflake table: {temp_stage_table}")
-            self._write_snowflake_with_retry(df, temp_stage_table, mode="overwrite")
-            set_clause = ", ".join([f"{c} = source.{c}" for c in df.columns])
-            insert_cols = ", ".join(df.columns)
-            insert_vals = ", ".join([f"source.{c}" for c in df.columns])
-            merge_sql = f"""
-                MERGE INTO {table} AS target
-                USING {temp_stage_table} AS source
-                ON target.{hash_column} = source.{hash_column}
-                WHEN MATCHED THEN UPDATE SET {set_clause}
-                WHEN NOT MATCHED THEN INSERT ({insert_cols}) VALUES ({insert_vals});
-            """
-            logging.info("Executing Snowflake MERGE statement")
-            self.spark._sc._jvm.net.snowflake.spark.snowflake.Utils.runQuery(self.snowflake_config.__dict__, merge_sql)
-            delete_sql = f"DELETE FROM {table} WHERE {hash_column} NOT IN (SELECT {hash_column} FROM {temp_stage_table})"
-            logging.info("Executing Snowflake DELETE statement for full sync")
-            self.spark._sc._jvm.net.snowflake.spark.snowflake.Utils.runQuery(self.snowflake_config.__dict__, delete_sql)
-            drop_sql = f"DROP TABLE IF EXISTS {temp_stage_table}"
-            self.spark._sc._jvm.net.snowflake.spark.snowflake.Utils.runQuery(self.snowflake_config.__dict__, drop_sql)
+            try:
+                existing = (
+                    self.spark.read.format("snowflake")
+                    .options(**self.snowflake_config.__dict__)
+                    .option("query", f"SELECT {hash_column} FROM {table}")
+                    .load()
+                )
+                df = df.join(existing, on=hash_column, how="left_anti")
+                if df.rdd.isEmpty():
+                    logging.info(f"No new records to append for Snowflake table: {table}")
+                    return
+            except Exception as exc:
+                logging.warning(f"Could not fetch existing hashes from Snowflake for {table}: {exc}")
+            mode = "append"
+        logging.info(f"Loading data into Snowflake table {table} with mode {mode}")
+        self._write_snowflake_with_retry(df, table, mode=mode)
         validation_query = f"SELECT COUNT(*) FROM {table}"
         snowflake_count_df = self._read_snowflake_with_retry(validation_query)
         snowflake_record_count = snowflake_count_df.collect()[0][0]
@@ -628,27 +572,17 @@ class LeadDepotETL:
     @log_exceptions()
     def process_table(self, table_name: str) -> None:
         logging.info(f"Starting to process table: {table_name}")
-        df, full_sync_needed = self.extract_table(table_name)
+        df, _ = self.extract_table(table_name)
         if df is None or df.rdd.isEmpty():
             logging.warning(f"Table {table_name} was excluded from processing or contains no data.")
             return
         df = self.add_hash_column(df, table_name)
         df = self.add_metadata_columns(df)
-        self.write_to_adls(df, table_name, full_sync_needed=full_sync_needed)
+        self.write_to_adls(df, table_name)
         if table_name in self.SNOWFLAKE_TABLES:
-            self.load_to_snowflake(df, self.SNOWFLAKE_TABLES[table_name], full_sync_needed=full_sync_needed)
+            self.load_to_snowflake(df, self.SNOWFLAKE_TABLES[table_name])
         else:
             logging.info(f"Table {table_name} is not configured for Snowflake loading.")
-
-        etl_col = "ETL_LAST_UPDATE_DATE"
-        if etl_col in df.columns:
-            max_val = df.agg({etl_col: "max"}).collect()[0][0]
-            if max_val:
-                self._write_watermark(table_name, str(max_val))
-            else:
-                logging.warning(f"No max value for {etl_col} in {table_name}. Watermark not updated.")
-        else:
-            logging.error(f"{etl_col} not present in data for {table_name}; cannot update watermark.")
 
     def run(self) -> None:
         logging.info("Starting the LeadDepot ETL process...")
